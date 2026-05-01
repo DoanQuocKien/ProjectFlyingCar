@@ -1,0 +1,35 @@
+{
+  "datasets": {
+    "hagrid": {
+      "kaggle_dataset": "kapitanov/hagrid",
+      "status": "missing_kaggle_token",
+      "timestamp": "2026-05-02 00:16:58",
+      "archive_path": null,
+      "archive_sha1": null,
+      "dataset_root": null,
+      "kaggle_token_found": false
+    },
+    "hagrid_subsample": {
+      "kaggle_dataset": "kapitanov/hagrid",
+      "status": "detected_existing",
+      "timestamp": "2026-05-02 00:36:11",
+      "dataset_root": "D:\\CS231\\ProjectFlyingCar\\data\\hagrid_subsample",
+      "auth_file": "C:\\Users\\Quoc Kien\\.kaggle\\access_token.txt",
+      "downloaded_files": [
+        "fist.json",
+        "four.json",
+        "one.json",
+        "peace.json",
+        "three.json"
+      ]
+    },
+    "hagrid_sample_30k_384p": {
+      "kaggle_dataset": "innominate817/hagrid-sample-30k-384p",
+      "status": "detected_existing",
+      "timestamp": "2026-05-02 01:02:06",
+      "archive_path": null,
+      "archive_sha1": null,
+      "dataset_root": "D:\\CS231\\ProjectFlyingCar\\data\\hagrid-sample-30k-384p",
+      "auth_file": "C:\\Users\\Quoc Kien\\.kaggle\\access_token.txt"
+    },
+    "
