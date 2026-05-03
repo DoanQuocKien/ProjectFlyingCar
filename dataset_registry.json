@@ -32,4 +32,21 @@
       "dataset_root": "D:\\CS231\\ProjectFlyingCar\\data\\hagrid-sample-30k-384p",
       "auth_file": "C:\\Users\\Quoc Kien\\.kaggle\\access_token.txt"
     },
-    "
+    "hagrid_sample_30k_384p_5class": {
+      "kaggle_dataset": "innominate817/hagrid-sample-30k-384p",
+      "status": "detected_existing",
+      "timestamp": "2026-05-02 14:26:01",
+      "archive_path": null,
+      "archive_sha1": null,
+      "dataset_root": "D:\\CS231\\ProjectFlyingCar\\data\\hagrid-sample-30k-384p-5class",
+      "auth_file": "C:\\Users\\Quoc Kien\\.kaggle\\access_token.txt",
+      "keep_classes": [
+        "one",
+        "peace",
+        "three",
+        "four",
+        "fist"
+      ]
+    }
+  }
+}
