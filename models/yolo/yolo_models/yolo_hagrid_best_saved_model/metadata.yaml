@@ -1,0 +1,22 @@
+description: Ultralytics YOLO11n model trained on /kaggle/working/yolo_hagrid_dataset/yolo_splits/data.yaml
+author: Ultralytics
+date: '2026-05-04T13:18:57.644113'
+version: 8.4.46
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: detect
+batch: 1
+imgsz:
+- 640
+- 640
+names:
+  0: one
+  1: peace
+  2: three
+  3: four
+  4: fist
+args:
+  batch: 1
+channels: 3
+end2end: false

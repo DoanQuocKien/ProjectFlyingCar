@@ -1,0 +1,33 @@
+{
+  "model_type": "Ultralytics YOLO",
+  "model_name": "YOLOv11n",
+  "model_file": "yolo11n.pt",
+  "classes": [
+    "one",
+    "peace",
+    "three",
+    "four",
+    "fist"
+  ],
+  "class_to_id": {
+    "one": 0,
+    "peace": 1,
+    "three": 2,
+    "four": 3,
+    "fist": 4
+  },
+  "image_size": 640,
+  "epochs_trained": 50,
+  "batch_size": 16,
+  "metrics": {
+    "mAP50": 0.9941394689436667,
+    "mAP50-95": 0.8602907546727807,
+    "Precision": 0.9941128068382226,
+    "Recall": 0.9807684400908823,
+    "Epochs_trained": 50,
+    "Model": "YOLOv11n",
+    "Environment": "kaggle"
+  },
+  "training_date": "2026-05-04T13:19:45.160889",
+  "environment": "kaggle"
+}
