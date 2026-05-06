@@ -29,6 +29,11 @@ DEFAULT_CHECKPOINT = Path(__file__).resolve().parent / "models" / "resnet18_hagr
 DEFAULT_MOBILENET_CHECKPOINT = Path(__file__).resolve().parent / "models" / "mobilenet_ssd_hagrid_detector.pt"
 DEFAULT_YOLO_CHECKPOINT = Path(__file__).resolve().parent / "models" / "yolo" / "yolo_models" / "yolo_runs" / "yolo_hagrid_best.pt"
 DEFAULT_CAR_IP = "http://192.168.137.228"
+BASE_SPEED = 150
+BOOST_SPEED = 250
+TURN_RATIO = 0.82
+LEFT_TRIM = 1.0
+RIGHT_TRIM = 0.82
 COMMAND_MAP = {
     "one": "forward",
     "peace": "right",
@@ -322,7 +327,19 @@ def compute_speed_from_box_size(
 
 def send_car_command(car_ip: str, command: str, speed: int, timeout: float = 1.0):
     try:
-        response = requests.get(f"{car_ip}/{command}", params={"speed": speed}, timeout=timeout)
+        if command == "stop":
+            speed_l = 0
+            speed_r = 0
+        else:
+            active_speed = int(speed * TURN_RATIO) if command in {"left", "right"} else speed
+            speed_l = int(active_speed * LEFT_TRIM)
+            speed_r = int(active_speed * RIGHT_TRIM)
+
+        response = requests.get(
+            f"{car_ip}/{command}",
+            params={"speedL": speed_l, "speedR": speed_r},
+            timeout=timeout,
+        )
         response.raise_for_status()
         return True
     except requests.RequestException:
