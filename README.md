@@ -62,6 +62,13 @@ python realtime_hand_detector.py --model resnet
 python realtime_hand_detector.py --model yolo
 ```
 
+To choose the YOLO checkpoint variant, use `--yolo-variant` (choices: `yolo26`, `yolo11n`). Example:
+
+```bash
+python realtime_hand_detector.py --model yolo --yolo-variant yolo11n
+python realtime_hand_detector.py --model yolo --yolo-variant yolo26
+```
+
 ### 4. Run the keyboard driver
 
 ```bash
@@ -85,6 +92,11 @@ Three detector architectures are supported, each with its own training notebook:
 | **ResNet-18** custom SSD head | `main_resnet18.ipynb` | `models/resnet18_hagrid_detector.pt` |
 | **MobileNetV3-Large** transfer SSD | `main_mobilenet_ssd.ipynb` | `models/mobilenet_ssd_hagrid_detector.pt` |
 | **YOLOv8** (Ultralytics) | `main_yolo.ipynb` | `models/yolo/yolo_models/yolo_runs/yolo_hagrid_best.pt` |
+
+Note: there are two YOLO variant checkpoints included in `models/`:
+
+- `models/yolo11n/yolo_models/yolo11n_hagrid_best.pt` (alias: `yolo11n`)
+- `models/yolo26/yolo_models/yolo_runs/yolo_hagrid_best.pt` (alias: `yolo26`)
 
 ### What each model does
 

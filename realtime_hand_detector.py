@@ -28,6 +28,9 @@ DEFAULT_CLASSES = ["one", "peace", "three", "four", "fist"]
 DEFAULT_CHECKPOINT = Path(__file__).resolve().parent / "models" / "resnet18_hagrid_detector.pt"
 DEFAULT_MOBILENET_CHECKPOINT = Path(__file__).resolve().parent / "models" / "mobilenet_ssd_hagrid_detector.pt"
 DEFAULT_YOLO_CHECKPOINT = Path(__file__).resolve().parent / "models" / "yolo" / "yolo_models" / "yolo_runs" / "yolo_hagrid_best.pt"
+# Added explicit YOLO variant checkpoints
+DEFAULT_YOLO11N_CHECKPOINT = Path(__file__).resolve().parent / "models" / "yolo11n" / "yolo_models" / "yolo11n_hagrid_best.pt"
+DEFAULT_YOLO26_CHECKPOINT = Path(__file__).resolve().parent / "models" / "yolo26" / "yolo_models" / "yolo_runs" / "yolo_hagrid_best.pt"
 DEFAULT_CAR_IP = "http://192.168.137.228"
 BASE_SPEED = 150
 BOOST_SPEED = 250
@@ -466,7 +469,8 @@ def parse_args():
     parser.add_argument("--model", choices=["resnet", "mobilenet", "yolo"], default=None, help="Which trained model to use (if not specified, will prompt interactively)")
     parser.add_argument("--checkpoint", type=Path, default=None, help="Path to the .pt model file (optional)")
     parser.add_argument("--mobilenet-checkpoint", type=Path, default=DEFAULT_MOBILENET_CHECKPOINT, help="MobileNet SSD checkpoint path")
-    parser.add_argument("--yolo-checkpoint", type=Path, default=DEFAULT_YOLO_CHECKPOINT, help="YOLO checkpoint path (ultralytics)")
+    parser.add_argument("--yolo-checkpoint", type=Path, default=None, help="YOLO checkpoint path (ultralytics)")
+    parser.add_argument("--yolo-variant", choices=["yolo26", "yolo11n"], default="yolo26", help="Which pretrained YOLO variant to use when --model=yolo")
     parser.add_argument("--camera", type=int, default=0, help="Webcam index")
     parser.add_argument("--score-threshold", type=float, default=0.30, help="Objectness threshold")
     parser.add_argument("--iou-threshold", type=float, default=0.40, help="NMS IoU threshold")
@@ -476,7 +480,10 @@ def parse_args():
 
 
 def interactive_model_selection():
-    """Prompt user to choose a model interactively."""
+    """Prompt user to choose a model interactively.
+
+    Returns a tuple: (model_choice, yolo_variant_or_None).
+    """
     print("\n" + "="*50)
     print("SELECT A MODEL FOR HAND DETECTION")
     print("="*50)
@@ -484,15 +491,26 @@ def interactive_model_selection():
     print("2) MobileNet SSD (faster, mobile-optimized)")
     print("3) YOLO (accurate but requires ultralytics)")
     print("="*50)
-    
+
     while True:
         choice = input("Enter choice (1-3) [default: 1]: ").strip()
         if choice == "" or choice == "1":
-            return "resnet"
+            return "resnet", None
         elif choice == "2":
-            return "mobilenet"
+            return "mobilenet", None
         elif choice == "3":
-            return "yolo"
+            # Prompt for YOLO variant when user picks YOLO in the UI
+            print("\nChoose YOLO variant:")
+            print("1) yolo26 (default)")
+            print("2) yolo11n")
+            while True:
+                v = input("Enter choice (1-2) [default: 1]: ").strip()
+                if v == "" or v == "1":
+                    return "yolo", "yolo26"
+                elif v == "2":
+                    return "yolo", "yolo11n"
+                else:
+                    print("Invalid choice. Please enter 1 or 2.")
         else:
             print("Invalid choice. Please enter 1, 2, or 3.")
 
@@ -503,7 +521,15 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Select checkpoint path based on requested model
-    chosen = args.model or interactive_model_selection()
+    if args.model is None:
+        chosen, interactive_variant = interactive_model_selection()
+        # If user selected a YOLO variant in the interactive UI, honor it
+        if interactive_variant is not None:
+            args.yolo_variant = interactive_variant
+    else:
+        chosen = args.model
+        interactive_variant = None
+
     print(f"\nSelected model: {chosen}")
 
     ckpt = None  # Track the actual checkpoint used
@@ -521,7 +547,10 @@ def main():
         model, id_to_class, img_size, grid_size = load_mobilenet_checkpoint(ckpt, device)
         model_kind = "grid"
     elif chosen == "yolo":
+        # Pick explicit checkpoint priority: --checkpoint > --yolo-checkpoint > variant default
         ckpt = args.checkpoint or args.yolo_checkpoint
+        if ckpt is None:
+            ckpt = DEFAULT_YOLO11N_CHECKPOINT if args.yolo_variant == "yolo11n" else DEFAULT_YOLO26_CHECKPOINT
         if not ckpt.exists():
             raise FileNotFoundError(f"YOLO checkpoint not found: {ckpt}")
         yolo_wrapper, id_to_class, img_size, grid_size = load_yolo_model(ckpt, device)
