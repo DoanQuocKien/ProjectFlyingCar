@@ -1,0 +1,7 @@
+{
+  "best_model_path": "/kaggle/working/models/mobilenet_ssd_hagrid_detector.pt",
+  "model_exists": true,
+  "env_info_file": "/kaggle/working/mobilenet_env_info.txt",
+  "classification_report": "/kaggle/working/mobilenet_classification_report.json",
+  "confusion_matrix": "/kaggle/working/mobilenet_confusion_matrix.png"
+}

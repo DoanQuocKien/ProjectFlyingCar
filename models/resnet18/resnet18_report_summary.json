@@ -1,0 +1,17 @@
+{
+  "best_model_path": "models/resnet18/resnet18_hagrid_detector.pt",
+  "model_exists": true,
+  "training_status": "COMPLETE",
+  "training_date": "2026-05-11",
+  "best_validation_accuracy": 0.9609,
+  "best_epoch": 19,
+  "test_accuracy": 0.9466,
+  "test_macro_f1": 0.9465,
+  "best_mean_iou": 0.7440,
+  "splits_file": "models/resnet18/resnet18_splits.json",
+  "env_info_file": "models/resnet18/resnet18_env_info.txt",
+  "classification_report": "models/resnet18/resnet18_classification_report.json",
+  "confusion_matrix": "models/resnet18/resnet18_confusion_matrix.png",
+  "training_history_csv": "models/resnet18/resnet18_training_history.csv",
+  "report_file": "model_reports/resnet18_report.md"
+}

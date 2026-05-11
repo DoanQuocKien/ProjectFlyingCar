@@ -114,6 +114,63 @@ That means the car-control layer does not change between models. Only the detect
 
 ---
 
+## Model reports and artifacts
+
+This repository includes a short, shareable set of model reports that summarise training, metrics, and deployment artifacts for each run. See the `model_reports/` folder for per-model writeups with reproducible evidence (metadata, `results.csv`, confusion matrices, and ONNX/SavedModel exports):
+
+- `model_reports/mobilenet_ssd_report.md` — MobileNetV3 transfer detector (compact, low-latency).
+- `model_reports/resnet18_report.md` — ResNet18 transfer detector (higher accuracy, larger footprint).
+- `model_reports/yolo11n_report.md` — YOLO (Ultralytics) small variant; ONNX-derived parameter summary included.
+- `model_reports/yolo26_report.md` — YOLO larger variant with epoch/latency highlights.
+
+These reports contain the exact hyperparameters and artifact paths used for the experiments and are the best starting point if you need to reproduce numbers or extract figures for a write-up.
+
+## Reproducing training and evaluation
+
+The training notebooks are the canonical way to reproduce runs. Tips to re-run:
+
+1. Create and activate a Python environment (tested with Python 3.11+).
+
+```bash
+conda create -n pfcar python=3.11 -y
+conda activate pfcar
+pip install -r requirements.txt  # if you create one; otherwise install key packages below
+pip install torch torchvision opencv-python requests ultralytics
+```
+
+2. Open the notebook you want to run in Jupyter, Colab, or Kaggle and run all cells. Notebooks auto-detect the environment and set paths accordingly.
+
+3. To run a quick sanity check that checkpoints load, use the provided smoke test:
+
+```bash
+python smoke_test.py
+```
+
+4. To run the real-time detector for manual benchmarking and visual checks:
+
+```bash
+python realtime_hand_detector.py --model mobilenet
+```
+
+## Evaluation and deployment notes
+
+- Exports: Ultralytics runs include ONNX and SavedModel/TFLite exports under the `models/` folders; use these for runtime benchmarking and deployment on mobile/edge devices.
+- Latency: the reports include measured latency values (ONNX CPU and per-batch training latency) — check the `model_reports/` entries for per-run numbers and recommended benchmarking commands.
+- Quantization: for production, prefer ONNX INT8 (with calibration) or TFLite float16/INT8 depending on target hardware; see the YOLO reports for suggested conversion/benchmark steps.
+
+## Quick model comparison (where to look)
+
+- Check `model_reports/` for parameter counts, best-epoch metrics, and measured latencies. This repository already includes ONNX-derived parameter totals for the YOLO runs and checkpoint-derived totals for MobileNet and ResNet.
+- For a compact comparison table, open `model_reports/README.md` (or ask me to generate one) and I can insert a short table comparing parameter counts and typical median latency values across models.
+
+## Contributing and extending
+
+- Add new checkpoints under `models/<model_name>/` and update or add a `model_reports/<model_name>_report.md` with the run metadata (hyperparameters, `results.csv`, and exported artifacts). The report format used here is a useful template.
+- If you change training code, update `CHANGES_SUMMARY.md` with a short note and a pointer to the notebook cell that changed.
+- For CI / automated checks, `smoke_test.py` is a lightweight guard to ensure saved checkpoints still load in the current environment.
+
+If you'd like, I can add a short `requirements.txt` capturing the exact packages used for experiments and a small `model_reports/summary.md` that shows a one-line complexity / size/latency comparison across the models.
+
 ## How the Runtime Works
 
 The real-time loop in `realtime_hand_detector.py` follows the same high-level steps regardless of model:

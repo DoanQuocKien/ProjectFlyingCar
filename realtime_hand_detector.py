@@ -47,10 +47,10 @@ COMMAND_MAP = {
 
 # Per-class size bias (optional tuning)
 CLASS_SIZE_WEIGHTS = {
-    "one": 1.0,
-    "peace": 1.0,
-    "three": 1.0,
-    "four": 0.85,
+    "one": 1.05,
+    "peace": 1.03,
+    "three": 1.015,
+    "four": 1.0,
     "fist": 1.0,
 }
 
@@ -149,7 +149,7 @@ def load_mobilenet_checkpoint(checkpoint_path: Path, device: torch.device):
 
 # --- YOLO wrapper (ultralytics) ---
 class YOLOWrapper:
-    def __init__(self, checkpoint_path: Path, device: torch.device, img_size: int = 640):
+    def __init__(self, checkpoint_path: Path, device: torch.device, img_size: int = 640, iou_threshold: float = 0.45):
         try:
             from ultralytics import YOLO
         except Exception as exc:
@@ -157,11 +157,52 @@ class YOLOWrapper:
         self.model = YOLO(str(checkpoint_path))
         self.device = device
         self.img_size = img_size
+        self.iou_threshold = iou_threshold
+
+    @staticmethod
+    def _box_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
+        x1 = max(float(box_a[0]), float(box_b[0]))
+        y1 = max(float(box_a[1]), float(box_b[1]))
+        x2 = min(float(box_a[2]), float(box_b[2]))
+        y2 = min(float(box_a[3]), float(box_b[3]))
+
+        inter_w = max(0.0, x2 - x1)
+        inter_h = max(0.0, y2 - y1)
+        inter_area = inter_w * inter_h
+
+        area_a = max(0.0, float(box_a[2]) - float(box_a[0])) * max(0.0, float(box_a[3]) - float(box_a[1]))
+        area_b = max(0.0, float(box_b[2]) - float(box_b[0])) * max(0.0, float(box_b[3]) - float(box_b[1]))
+        union = area_a + area_b - inter_area
+        if union <= 0.0:
+            return 0.0
+        return inter_area / union
+
+    def _suppress_overlapping_detections(self, xyxy: np.ndarray, confs: np.ndarray, cls: np.ndarray):
+        if len(xyxy) <= 1:
+            return xyxy, confs, cls
+
+        order = np.argsort(-confs)
+        keep: list[int] = []
+
+        for idx in order:
+            candidate_box = xyxy[idx]
+            if all(self._box_iou(candidate_box, xyxy[kept_idx]) <= self.iou_threshold for kept_idx in keep):
+                keep.append(int(idx))
+
+        keep_indices = np.asarray(keep, dtype=int)
+        return xyxy[keep_indices], confs[keep_indices], cls[keep_indices]
 
     def predict_frame(self, frame_bgr: np.ndarray, score_threshold: float = 0.25):
         # ultralytics accepts RGB numpy arrays
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        results = self.model(frame_rgb, imgsz=self.img_size, conf=score_threshold)
+        results = self.model(
+            frame_rgb,
+            imgsz=self.img_size,
+            conf=score_threshold,
+            iou=self.iou_threshold,
+            agnostic_nms=True,
+            max_det=10,
+        )
         if len(results) == 0:
             return None
         res = results[0]
@@ -177,6 +218,7 @@ class YOLOWrapper:
         xyxy = xyxy[keep_mask]
         confs = confs[keep_mask]
         cls = cls[keep_mask]
+        xyxy, confs, cls = self._suppress_overlapping_detections(xyxy, confs, cls)
         h, w = frame_bgr.shape[:2]
         boxes_norm = torch.from_numpy(xyxy / np.array([w, h, w, h], dtype=float)).float()
         scores = torch.from_numpy(confs).float()
@@ -191,14 +233,60 @@ def load_yolo_model(checkpoint_path: Path, device: torch.device):
     return wrapper, id_to_class, wrapper.img_size, None
 
 
+def _box_iou_torch(box_a: torch.Tensor, box_b: torch.Tensor) -> torch.Tensor:
+    """Compute IoU between two boxes (normalized coords 0-1)."""
+    x1 = torch.max(box_a[0], box_b[0])
+    y1 = torch.max(box_a[1], box_b[1])
+    x2 = torch.min(box_a[2], box_b[2])
+    y2 = torch.min(box_a[3], box_b[3])
+
+    inter_w = torch.clamp(x2 - x1, min=0.0)
+    inter_h = torch.clamp(y2 - y1, min=0.0)
+    inter_area = inter_w * inter_h
+
+    area_a = torch.clamp(box_a[2] - box_a[0], min=0.0) * torch.clamp(box_a[3] - box_a[1], min=0.0)
+    area_b = torch.clamp(box_b[2] - box_b[0], min=0.0) * torch.clamp(box_b[3] - box_b[1], min=0.0)
+    union = area_a + area_b - inter_area
+    union = torch.clamp(union, min=1e-6)
+    return inter_area / union
+
+
+def _suppress_overlapping_detections_torch(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    iou_threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply class-agnostic suppression to overlapping detections."""
+    if len(boxes) <= 1:
+        return boxes, scores, labels
+
+    order = torch.argsort(scores, descending=True)
+    keep: list[int] = []
+
+    for idx in order:
+        candidate_box = boxes[idx]
+        if all(
+            _box_iou_torch(candidate_box, boxes[kept_idx]).item() <= iou_threshold
+            for kept_idx in keep
+        ):
+            keep.append(int(idx.item()))
+
+    keep_indices = torch.tensor(keep, dtype=torch.long, device=boxes.device)
+    return boxes[keep_indices], scores[keep_indices], labels[keep_indices]
+
+
 def decode_predictions(
     obj_logits: torch.Tensor,
     box_preds: torch.Tensor,
     cls_logits: torch.Tensor,
-    grid_size: int,
+    grid_size: int | None,
     score_threshold: float,
     iou_threshold: float,
 ):
+    if grid_size is None:
+        grid_size = int(obj_logits.shape[-1])
+
     obj_probs = torch.sigmoid(obj_logits)
     batch_predictions = []
 
@@ -229,11 +317,19 @@ def decode_predictions(
         kept_indices = nms(boxes, filtered_probs, iou_threshold)
         class_ids = torch.argmax(cls_logits[batch_index, cell_y, cell_x], dim=1)
 
+        # Apply class-agnostic overlap suppression
+        boxes_nms = boxes[kept_indices]
+        scores_nms = filtered_probs[kept_indices]
+        labels_nms = class_ids[kept_indices]
+        boxes_final, scores_final, labels_final = _suppress_overlapping_detections_torch(
+            boxes_nms, scores_nms, labels_nms, iou_threshold
+        )
+
         batch_predictions.append(
             {
-                "boxes": boxes[kept_indices],
-                "scores": filtered_probs[kept_indices],
-                "labels": class_ids[kept_indices],
+                "boxes": boxes_final,
+                "scores": scores_final,
+                "labels": labels_final,
             }
         )
 
@@ -534,17 +630,20 @@ def main():
 
     ckpt = None  # Track the actual checkpoint used
 
+    grid_model = None
+    yolo_model = None
+
     if chosen == "resnet":
         ckpt = args.checkpoint or DEFAULT_CHECKPOINT
         if not ckpt.exists():
             raise FileNotFoundError(f"ResNet checkpoint not found: {ckpt}")
-        model, id_to_class, img_size, grid_size = load_checkpoint(ckpt, device)
+        grid_model, id_to_class, img_size, grid_size = load_checkpoint(ckpt, device)
         model_kind = "grid"
     elif chosen == "mobilenet":
         ckpt = args.checkpoint or args.mobilenet_checkpoint
         if not ckpt.exists():
             raise FileNotFoundError(f"MobileNet checkpoint not found: {ckpt}")
-        model, id_to_class, img_size, grid_size = load_mobilenet_checkpoint(ckpt, device)
+        grid_model, id_to_class, img_size, grid_size = load_mobilenet_checkpoint(ckpt, device)
         model_kind = "grid"
     elif chosen == "yolo":
         # Pick explicit checkpoint priority: --checkpoint > --yolo-checkpoint > variant default
@@ -553,8 +652,8 @@ def main():
             ckpt = DEFAULT_YOLO11N_CHECKPOINT if args.yolo_variant == "yolo11n" else DEFAULT_YOLO26_CHECKPOINT
         if not ckpt.exists():
             raise FileNotFoundError(f"YOLO checkpoint not found: {ckpt}")
-        yolo_wrapper, id_to_class, img_size, grid_size = load_yolo_model(ckpt, device)
-        model = yolo_wrapper
+        yolo_model, id_to_class, img_size, grid_size = load_yolo_model(ckpt, device)
+        yolo_model.iou_threshold = args.iou_threshold
         model_kind = "yolo"
     else:
         raise ValueError(f"Unknown model choice: {chosen}")
@@ -606,8 +705,9 @@ def main():
 
                 if should_infer:
                     if model_kind == "grid":
+                        assert grid_model is not None
                         input_tensor = preprocess_frame(frame, img_size, device)
-                        obj_logits, box_preds, cls_logits = model(input_tensor)
+                        obj_logits, box_preds, cls_logits = grid_model(input_tensor)
                         predictions = decode_predictions(
                             obj_logits,
                             box_preds,
@@ -618,7 +718,8 @@ def main():
                         )[0]
                     else:
                         # YOLO pipeline returns normalized boxes directly
-                        predictions = model.predict_frame(frame, score_threshold=args.score_threshold)
+                        assert yolo_model is not None
+                        predictions = yolo_model.predict_frame(frame, score_threshold=args.score_threshold)
 
                     last_detection = predictions
 
