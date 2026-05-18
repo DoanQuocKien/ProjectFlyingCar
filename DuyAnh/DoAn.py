@@ -9,7 +9,7 @@ import math # Thêm thư viện math để tính khoảng cách
 # =========================
 # CẤU HÌNH ĐIỀU KHIỂN XE & TUNING
 # =========================
-ESP32_IP = "http://192.168.137.12"
+ESP32_IP = "http://192.168.137.37"
 
 # -- KHU VỰC CÂN CHỈNH (TUNE) --
 BASE_SPEED = 150  # Tốc độ cơ sở bình thường (0 - 255)

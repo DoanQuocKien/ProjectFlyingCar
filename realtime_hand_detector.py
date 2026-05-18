@@ -283,6 +283,8 @@ def decode_predictions(
     grid_size: int | None,
     score_threshold: float,
     iou_threshold: float,
+    detection_mode: str = "single",
+    max_det: int = 1,
 ):
     if grid_size is None:
         grid_size = int(obj_logits.shape[-1])
@@ -324,6 +326,21 @@ def decode_predictions(
         boxes_final, scores_final, labels_final = _suppress_overlapping_detections_torch(
             boxes_nms, scores_nms, labels_nms, iou_threshold
         )
+
+        if len(scores_final) > 0:
+            order = torch.argsort(scores_final, descending=True)
+            boxes_final = boxes_final[order]
+            scores_final = scores_final[order]
+            labels_final = labels_final[order]
+
+        if detection_mode == "single" and len(scores_final) > 1:
+            boxes_final = boxes_final[:1]
+            scores_final = scores_final[:1]
+            labels_final = labels_final[:1]
+        elif detection_mode == "multi" and max_det > 0 and len(scores_final) > max_det:
+            boxes_final = boxes_final[:max_det]
+            scores_final = scores_final[:max_det]
+            labels_final = labels_final[:max_det]
 
         batch_predictions.append(
             {
@@ -570,6 +587,30 @@ def parse_args():
     parser.add_argument("--camera", type=int, default=0, help="Webcam index")
     parser.add_argument("--score-threshold", type=float, default=0.30, help="Objectness threshold")
     parser.add_argument("--iou-threshold", type=float, default=0.40, help="NMS IoU threshold")
+    parser.add_argument(
+        "--detection-mode",
+        choices=["single", "multi"],
+        default="single",
+        help="Detection mode for grid models: single keeps only top-1, multi allows multiple boxes",
+    )
+    parser.add_argument(
+        "--max-det",
+        type=int,
+        default=3,
+        help="Maximum detections to keep in multi mode",
+    )
+    parser.add_argument(
+        "--no-hand-frames",
+        type=int,
+        default=3,
+        help="Consecutive missed inference frames required before declaring no hand",
+    )
+    parser.add_argument(
+        "--hold-last-detection-ms",
+        type=int,
+        default=180,
+        help="How long to keep the last valid detection during brief dropouts",
+    )
     parser.add_argument("--car-ip", type=str, default=DEFAULT_CAR_IP, help="Base URL of the wireless car controller")
     parser.add_argument("--mirror", action="store_true", help="Mirror the webcam preview")
     return parser.parse_args()
@@ -662,6 +703,8 @@ def main():
     last_speed = None
     last_send_time = 0.0
     last_detection = None
+    last_valid_detection_time = 0.0
+    no_hand_streak = 0
     last_gesture = "none"
     last_box_area = 0.0
     last_confidence = 0.0
@@ -704,24 +747,43 @@ def main():
                 sent = sender.get_last_status()
 
                 if should_infer:
+                    raw_predictions = None
                     if model_kind == "grid":
                         assert grid_model is not None
                         input_tensor = preprocess_frame(frame, img_size, device)
                         obj_logits, box_preds, cls_logits = grid_model(input_tensor)
-                        predictions = decode_predictions(
+                        raw_predictions = decode_predictions(
                             obj_logits,
                             box_preds,
                             cls_logits,
                             grid_size=grid_size,
                             score_threshold=args.score_threshold,
                             iou_threshold=args.iou_threshold,
+                            detection_mode=args.detection_mode,
+                            max_det=args.max_det,
                         )[0]
                     else:
                         # YOLO pipeline returns normalized boxes directly
                         assert yolo_model is not None
-                        predictions = yolo_model.predict_frame(frame, score_threshold=args.score_threshold)
+                        raw_predictions = yolo_model.predict_frame(frame, score_threshold=args.score_threshold)
 
-                    last_detection = predictions
+                    now = time.perf_counter()
+                    hold_seconds = max(0.0, float(args.hold_last_detection_ms) / 1000.0)
+                    has_valid = raw_predictions is not None and len(raw_predictions["boxes"]) > 0
+
+                    if has_valid:
+                        no_hand_streak = 0
+                        last_detection = raw_predictions
+                        last_valid_detection_time = now
+                        predictions = raw_predictions
+                    else:
+                        no_hand_streak += 1
+                        can_hold_last = (
+                            last_detection is not None
+                            and (now - last_valid_detection_time) <= hold_seconds
+                            and no_hand_streak < args.no_hand_frames
+                        )
+                        predictions = last_detection if can_hold_last else None
 
                     if predictions is not None and len(predictions["boxes"]) > 0:
                         box = predictions["boxes"][0]
@@ -748,6 +810,7 @@ def main():
                         speed = 0
                         confidence = 0.0
                         box_area = 0.0
+                        last_detection = None
                         last_gesture = gesture
                         last_box_area = box_area
                         last_confidence = confidence
