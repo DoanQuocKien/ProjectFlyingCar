@@ -5,11 +5,12 @@ import numpy as np
 import requests
 import time
 import math # Thêm thư viện math để tính khoảng cách
+from pathlib import Path
 
 # =========================
 # CẤU HÌNH ĐIỀU KHIỂN XE & TUNING
 # =========================
-ESP32_IP = "http://192.168.137.37"
+ESP32_IP = "http://192.168.137.195"
 
 # -- KHU VỰC CÂN CHỈNH (TUNE) --
 BASE_SPEED = 150  # Tốc độ cơ sở bình thường (0 - 255)
@@ -56,7 +57,9 @@ def send_car_command(cmd, target_base_speed=BASE_SPEED):
 # =========================
 # LOAD MODEL
 # =========================
-checkpoint = torch.load("gesture_model.pth", weights_only=False)
+SCRIPT_DIR = Path(__file__).resolve().parent
+checkpoint_path = SCRIPT_DIR / "gesture_model.pth"
+checkpoint = torch.load(checkpoint_path, weights_only=False)
 
 classes = checkpoint["classes"]
 input_dim = checkpoint["input_dim"]

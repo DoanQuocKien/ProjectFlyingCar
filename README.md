@@ -205,18 +205,22 @@ For the ResNet and MobileNet paths, the model predicts three things on a grid:
 
 The final gesture is chosen by taking the highest class score at the selected cell. In practice, the code keeps the detection with the best objectness score after NMS.
 
-### 2. Bounding-box area to speed
+### 2. Hand-motion speed control
 
-The runtime turns the detected hand size into speed with a nonlinear mapping:
+The runtime now turns hand movement into speed instead of using the apparent hand size. Fresh detector boxes record the hand-center movement, and the active command repeats with the last stable speed until the gesture changes or `stop` is detected. The motion signal is:
 
-`speed = round(s_min + area^0.35 * (s_max - s_min))`
+`motion = distance(center_t, center_t-1) / delta_time`
 
-where `area` is the normalized box area in `[0, 1]`, and `s_min` / `s_max` are the speed limits.
+The distance is normalized by the image diagonal, so the value is comparable across webcam resolutions. Tiny displacements are accumulated from a stable anchor point before they count as movement, which lets slow intentional movement register while one-frame jitter is ignored. The motion value is then filtered before becoming a car speed:
 
-This means:
-- a small hand box gives a lower speed,
-- a larger box gives a higher speed,
-- the curve is intentionally nonlinear so the speed changes more smoothly near the middle range.
+- accumulated motion below `--motion-deadzone` is ignored as detector jitter,
+- an exponential moving average smooths sudden bounding-box jumps,
+- `--motion-low` maps to the minimum active speed,
+- `--motion-high` maps to the maximum active speed,
+- `--motion-curve` controls how strongly low-speed motion affects the car speed,
+- idle motion keeps the last stable speed instead of decaying back to `127`.
+
+That means a faster hand movement produces a faster car command, while simply moving the hand closer to the camera no longer increases speed. The old bounding-box-area behavior is still available for comparison with `--speed-mode box`.
 
 ### 3. Wheel-speed optimization for the car
 
@@ -304,13 +308,30 @@ Available options:
 --model       Model to use: resnet | mobilenet | yolo  (interactive if omitted)
 --checkpoint  Path to a custom checkpoint file
 --car-ip      ESP32 car IP address
+--yolo-variant  YOLO checkpoint variant: yolo11n | yolo26 (default: yolo11n)
+--yolo-img-size Realtime YOLO inference size; lower is faster (default: 416)
+--yolo-max-det  Maximum YOLO detections per frame (default: 1)
 --camera      Webcam index (default: 0)
+--camera-width  Webcam capture width (default: 640)
+--camera-height Webcam capture height (default: 480)
+--display-scale Preview scale factor for better UI FPS (default: 0.75)
 --score-threshold  Detection confidence threshold (default: 0.30)
 --iou-threshold    NMS IoU threshold (default: 0.40)
+--speed-mode       Speed source: motion | box  (default: motion)
+--motion-deadzone  Ignore small accumulated hand-center jitter (default: 0.06)
+--motion-low       Motion value mapped to minimum speed (default: 0.04)
+--motion-high      Motion value mapped to maximum speed (default: 0.55)
+--motion-smoothing EMA factor for motion speed smoothing (default: 0.50)
+--motion-curve     Motion response curve; lower is more sensitive (default: 0.65)
+--inference-stride Run detector every N displayed frames before active-command cooldown (default: 4)
+--detect-cooldown-ms Wait after a valid active gesture before running detector again (default: 0)
+--command-window   Speed samples averaged before sending a command (default: 3)
+--repeat-command-ms Repeat the last stable active command at this interval (default: 120)
+--speed-change-threshold Minimum speed delta before updating the latched command (default: 12)
 --mirror      Mirror the webcam preview
 ```
 
-When the detector is running, the window shows the predicted gesture, command, speed, bounding-box area, and link status.
+When the detector is running, the window shows the predicted gesture, command, speed, speed mode, smoothed motion value, bounding-box area, and link status.
 
 ### Useful run patterns
 

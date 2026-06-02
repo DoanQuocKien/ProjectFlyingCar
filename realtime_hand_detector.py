@@ -31,12 +31,19 @@ DEFAULT_YOLO_CHECKPOINT = Path(__file__).resolve().parent / "models" / "yolo" / 
 # Added explicit YOLO variant checkpoints
 DEFAULT_YOLO11N_CHECKPOINT = Path(__file__).resolve().parent / "models" / "yolo11n" / "yolo_models" / "yolo11n_hagrid_best.pt"
 DEFAULT_YOLO26_CHECKPOINT = Path(__file__).resolve().parent / "models" / "yolo26" / "yolo_models" / "yolo_runs" / "yolo_hagrid_best.pt"
-DEFAULT_CAR_IP = "http://192.168.137.228"
+DEFAULT_CAR_IP = "http://192.168.137.93"
 BASE_SPEED = 150
 BOOST_SPEED = 250
 TURN_RATIO = 0.82
 LEFT_TRIM = 1.0
 RIGHT_TRIM = 0.82
+MIN_CAR_SPEED = 127
+MAX_CAR_SPEED = 255
+DEFAULT_MOTION_LOW = 0.04
+DEFAULT_MOTION_HIGH = 0.55
+DEFAULT_MOTION_DEADZONE = 0.06
+DEFAULT_MOTION_SMOOTHING = 0.50
+DEFAULT_MOTION_CURVE = 0.65
 COMMAND_MAP = {
     "one": "forward",
     "peace": "right",
@@ -149,7 +156,14 @@ def load_mobilenet_checkpoint(checkpoint_path: Path, device: torch.device):
 
 # --- YOLO wrapper (ultralytics) ---
 class YOLOWrapper:
-    def __init__(self, checkpoint_path: Path, device: torch.device, img_size: int = 640, iou_threshold: float = 0.45):
+    def __init__(
+        self,
+        checkpoint_path: Path,
+        device: torch.device,
+        img_size: int = 416,
+        iou_threshold: float = 0.45,
+        max_det: int = 1,
+    ):
         try:
             from ultralytics import YOLO
         except Exception as exc:
@@ -158,6 +172,13 @@ class YOLOWrapper:
         self.device = device
         self.img_size = img_size
         self.iou_threshold = iou_threshold
+        self.max_det = max(1, max_det)
+        self.device_arg = 0 if device.type == "cuda" else "cpu"
+        self.use_half = device.type == "cuda"
+        try:
+            self.model.to(self.device_arg)
+        except Exception:
+            pass
 
     @staticmethod
     def _box_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
@@ -193,15 +214,16 @@ class YOLOWrapper:
         return xyxy[keep_indices], confs[keep_indices], cls[keep_indices]
 
     def predict_frame(self, frame_bgr: np.ndarray, score_threshold: float = 0.25):
-        # ultralytics accepts RGB numpy arrays
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         results = self.model(
-            frame_rgb,
+            frame_bgr,
             imgsz=self.img_size,
             conf=score_threshold,
             iou=self.iou_threshold,
             agnostic_nms=True,
-            max_det=10,
+            max_det=self.max_det,
+            device=self.device_arg,
+            half=self.use_half,
+            verbose=False,
         )
         if len(results) == 0:
             return None
@@ -218,7 +240,8 @@ class YOLOWrapper:
         xyxy = xyxy[keep_mask]
         confs = confs[keep_mask]
         cls = cls[keep_mask]
-        xyxy, confs, cls = self._suppress_overlapping_detections(xyxy, confs, cls)
+        if len(xyxy) > 1:
+            xyxy, confs, cls = self._suppress_overlapping_detections(xyxy, confs, cls)
         h, w = frame_bgr.shape[:2]
         boxes_norm = torch.from_numpy(xyxy / np.array([w, h, w, h], dtype=float)).float()
         scores = torch.from_numpy(confs).float()
@@ -226,9 +249,9 @@ class YOLOWrapper:
         return {"boxes": boxes_norm, "scores": scores, "labels": labels}
 
 
-def load_yolo_model(checkpoint_path: Path, device: torch.device):
+def load_yolo_model(checkpoint_path: Path, device: torch.device, img_size: int = 416, max_det: int = 1):
     # Return a wrapper and dummy id_to_class mapping
-    wrapper = YOLOWrapper(checkpoint_path, device)
+    wrapper = YOLOWrapper(checkpoint_path, device, img_size=img_size, max_det=max_det)
     id_to_class = {i: name for i, name in enumerate(DEFAULT_CLASSES)}
     return wrapper, id_to_class, wrapper.img_size, None
 
@@ -426,8 +449,8 @@ def draw_predictions(
 
 def compute_speed_from_box_size(
     box,
-    min_speed: int = 127,
-    max_speed: int = 255,
+    min_speed: int = MIN_CAR_SPEED,
+    max_speed: int = MAX_CAR_SPEED,
 ) -> int:
     x1, y1, x2, y2 = np.asarray(box.detach().cpu().numpy(), dtype=np.float32)
     width = max(0.0, x2 - x1)
@@ -439,6 +462,222 @@ def compute_speed_from_box_size(
     mapped = min_speed + curve * (max_speed - min_speed)
     speed = int(round(mapped))
     return max(min_speed, min(max_speed, speed))
+
+
+def get_box_center(box) -> np.ndarray:
+    x1, y1, x2, y2 = np.asarray(box.detach().cpu().numpy(), dtype=np.float32)
+    return np.asarray([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float32)
+
+
+def get_box_center_from_array(box: np.ndarray) -> np.ndarray:
+    x1, y1, x2, y2 = np.asarray(box, dtype=np.float32)
+    return np.asarray([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float32)
+
+
+class HandMotionSpeedTracker:
+    """Convert hand center motion into a stable car speed command."""
+
+    def __init__(
+        self,
+        min_speed: int = MIN_CAR_SPEED,
+        max_speed: int = MAX_CAR_SPEED,
+        low_velocity: float = DEFAULT_MOTION_LOW,
+        high_velocity: float = DEFAULT_MOTION_HIGH,
+        deadzone: float = DEFAULT_MOTION_DEADZONE,
+        smoothing: float = DEFAULT_MOTION_SMOOTHING,
+        curve: float = DEFAULT_MOTION_CURVE,
+    ):
+        self.min_speed = min_speed
+        self.max_speed = max_speed
+        self.low_velocity = max(0.0, low_velocity)
+        self.high_velocity = max(self.low_velocity + 1e-6, high_velocity)
+        self.deadzone = max(0.0, deadzone)
+        self.smoothing = max(0.0, min(1.0, smoothing))
+        self.curve = max(0.2, min(2.0, curve))
+        self.prev_center: np.ndarray | None = None
+        self.prev_time: float | None = None
+        self.anchor_center: np.ndarray | None = None
+        self.anchor_time: float | None = None
+        self.smoothed_velocity = 0.0
+        self.current_speed = min_speed
+
+    def reset(self):
+        self.prev_center = None
+        self.prev_time = None
+        self.anchor_center = None
+        self.anchor_time = None
+        self.smoothed_velocity = 0.0
+        self.current_speed = self.min_speed
+
+    def update_center(self, center: np.ndarray, timestamp: float) -> tuple[int, float]:
+        center = np.asarray(center, dtype=np.float32)
+        if self.prev_center is None or self.prev_time is None:
+            self.prev_center = center
+            self.prev_time = timestamp
+            self.anchor_center = center
+            self.anchor_time = timestamp
+            self.current_speed = self.min_speed
+            return self.current_speed, self.smoothed_velocity
+
+        if self.anchor_center is None or self.anchor_time is None:
+            self.anchor_center = self.prev_center
+            self.anchor_time = self.prev_time
+
+        dt = max(1e-3, timestamp - self.anchor_time)
+        distance = float(np.linalg.norm(center - self.anchor_center) / np.sqrt(2.0))
+        raw_velocity = distance / dt
+        if distance < self.deadzone:
+            self.prev_center = center
+            self.prev_time = timestamp
+            return self.current_speed, self.smoothed_velocity
+
+        alpha = self.smoothing
+        self.smoothed_velocity = alpha * raw_velocity + (1.0 - alpha) * self.smoothed_velocity
+        ratio = (self.smoothed_velocity - self.low_velocity) / (self.high_velocity - self.low_velocity)
+        ratio = max(0.0, min(1.0, ratio))
+        ratio = ratio ** self.curve
+        mapped = self.min_speed + ratio * (self.max_speed - self.min_speed)
+        self.current_speed = int(round(mapped))
+        self.prev_center = center
+        self.prev_time = timestamp
+        self.anchor_center = center
+        self.anchor_time = timestamp
+        return self.current_speed, self.smoothed_velocity
+
+    def update(self, box, timestamp: float) -> tuple[int, float]:
+        return self.update_center(get_box_center(box), timestamp)
+
+    def peek(self) -> tuple[int, float]:
+        return self.current_speed, self.smoothed_velocity
+
+
+class HandOpticalFlowTracker:
+    """Track hand-box center cheaply between slower detector frames."""
+
+    def __init__(self, max_points: int = 40, min_points: int = 6):
+        self.max_points = max_points
+        self.min_points = min_points
+        self.prev_gray: np.ndarray | None = None
+        self.prev_points: np.ndarray | None = None
+        self.box_norm: np.ndarray | None = None
+
+    def reset(self):
+        self.prev_gray = None
+        self.prev_points = None
+        self.box_norm = None
+
+    def seed(self, frame_bgr: np.ndarray, box) -> np.ndarray:
+        self.reset()
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        frame_h, frame_w = gray.shape[:2]
+        self.box_norm = np.asarray(box.detach().cpu().numpy(), dtype=np.float32).copy()
+        x1, y1, x2, y2 = self._box_to_pixels(self.box_norm, frame_w, frame_h)
+
+        roi = gray[y1:y2, x1:x2]
+        points = None
+        if roi.size > 0 and roi.shape[0] >= 4 and roi.shape[1] >= 4:
+            points = cv2.goodFeaturesToTrack(
+                roi,
+                maxCorners=self.max_points,
+                qualityLevel=0.01,
+                minDistance=5,
+                blockSize=5,
+            )
+
+        if points is None or len(points) < self.min_points:
+            points = self._fallback_points(x1, y1, x2, y2)
+        else:
+            points[:, 0, 0] += x1
+            points[:, 0, 1] += y1
+
+        self.prev_gray = gray
+        self.prev_points = points.astype(np.float32)
+        return get_box_center_from_array(self.box_norm)
+
+    def update(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+        if self.prev_gray is None or self.prev_points is None or self.box_norm is None:
+            return None
+
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        next_points, status, _ = cv2.calcOpticalFlowPyrLK(
+            self.prev_gray,
+            gray,
+            self.prev_points,
+            None,
+            winSize=(21, 21),
+            maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
+        )
+        if next_points is None or status is None:
+            self.reset()
+            return None
+
+        valid = status.reshape(-1) == 1
+        if int(valid.sum()) < self.min_points:
+            self.reset()
+            return None
+
+        old_valid = self.prev_points[valid].reshape(-1, 2)
+        new_valid = next_points[valid].reshape(-1, 2)
+        shift_px = np.median(new_valid - old_valid, axis=0)
+
+        frame_h, frame_w = gray.shape[:2]
+        dx = float(shift_px[0] / max(1, frame_w))
+        dy = float(shift_px[1] / max(1, frame_h))
+        self.box_norm[[0, 2]] += dx
+        self.box_norm[[1, 3]] += dy
+        self.box_norm = self._clip_box(self.box_norm)
+
+        self.prev_gray = gray
+        self.prev_points = next_points[valid].reshape(-1, 1, 2).astype(np.float32)
+        return self.box_norm.copy(), get_box_center_from_array(self.box_norm)
+
+    @staticmethod
+    def _clip_box(box: np.ndarray) -> np.ndarray:
+        width = max(1e-4, float(box[2] - box[0]))
+        height = max(1e-4, float(box[3] - box[1]))
+        box[0] = max(0.0, min(1.0 - width, float(box[0])))
+        box[1] = max(0.0, min(1.0 - height, float(box[1])))
+        box[2] = min(1.0, box[0] + width)
+        box[3] = min(1.0, box[1] + height)
+        return box
+
+    @staticmethod
+    def _box_to_pixels(box: np.ndarray, frame_w: int, frame_h: int) -> tuple[int, int, int, int]:
+        x1, y1, x2, y2 = box.tolist()
+        x1 = max(0, min(frame_w - 2, int(round(x1 * frame_w))))
+        y1 = max(0, min(frame_h - 2, int(round(y1 * frame_h))))
+        x2 = max(x1 + 1, min(frame_w - 1, int(round(x2 * frame_w))))
+        y2 = max(y1 + 1, min(frame_h - 1, int(round(y2 * frame_h))))
+        return x1, y1, x2, y2
+
+    @staticmethod
+    def _fallback_points(x1: int, y1: int, x2: int, y2: int) -> np.ndarray:
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        points = np.asarray(
+            [
+                [cx, cy],
+                [x1, y1],
+                [x2, y1],
+                [x1, y2],
+                [x2, y2],
+                [(x1 + cx) * 0.5, cy],
+                [(x2 + cx) * 0.5, cy],
+                [cx, (y1 + cy) * 0.5],
+                [cx, (y2 + cy) * 0.5],
+            ],
+            dtype=np.float32,
+        )
+        return points.reshape(-1, 1, 2)
+
+
+def make_single_prediction(box_norm: np.ndarray, score: float, label: int):
+    return {
+        "boxes": torch.as_tensor([box_norm], dtype=torch.float32),
+        "scores": torch.as_tensor([score], dtype=torch.float32),
+        "labels": torch.as_tensor([label], dtype=torch.long),
+    }
 
 
 def send_car_command(car_ip: str, command: str, speed: int, timeout: float = 1.0):
@@ -463,8 +702,12 @@ def send_car_command(car_ip: str, command: str, speed: int, timeout: float = 1.0
 
 
 class CameraStream:
-    def __init__(self, camera_index: int):
+    def __init__(self, camera_index: int, width: int | None = None, height: int | None = None):
         self.cap = open_camera(camera_index)
+        if width is not None and width > 0:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        if height is not None and height > 0:
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.lock = threading.Lock()
         self.frame = None
@@ -544,23 +787,30 @@ def draw_status_panel(
     command: str,
     gesture: str,
     speed: int,
+    locked_command: str,
+    locked_speed: int,
     car_ip: str,
     sent: bool,
     confidence: float,
     box_area: float,
+    motion_velocity: float,
+    speed_mode: str,
 ):
     panel_color = (30, 30, 30)
     overlay = frame_bgr.copy()
     frame_h, frame_w = frame_bgr.shape[:2]
-    panel_right = min(frame_w - 10, 430)
-    cv2.rectangle(overlay, (10, 10), (panel_right, 155), panel_color, thickness=-1)
+    panel_right = min(frame_w - 10, 500)
+    cv2.rectangle(overlay, (10, 10), (panel_right, 215), panel_color, thickness=-1)
     cv2.addWeighted(overlay, 0.55, frame_bgr, 0.45, 0, frame_bgr)
 
     status_color = (0, 200, 0) if sent else (0, 0, 255)
     cv2.putText(frame_bgr, f"Gesture: {gesture}", (25, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.putText(frame_bgr, f"Command: {command}", (25, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.putText(frame_bgr, f"Speed: {speed}", (25, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(frame_bgr, f"Box: {box_area:.3f}", (25, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(frame_bgr, f"Locked: {locked_command}-{locked_speed}", (25, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(frame_bgr, f"Mode: {speed_mode}", (25, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(frame_bgr, f"Motion: {motion_velocity:.2f}", (25, 195), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(frame_bgr, f"Box: {box_area:.3f}", (235, 195), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1, cv2.LINE_AA)
     cv2.putText(frame_bgr, f"Car: {car_ip}", (225, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1, cv2.LINE_AA)
     cv2.circle(frame_bgr, (404, 108), 10, status_color, thickness=-1)
     cv2.putText(frame_bgr, "SENT" if sent else "NO LINK", (360, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
@@ -583,8 +833,18 @@ def parse_args():
     parser.add_argument("--checkpoint", type=Path, default=None, help="Path to the .pt model file (optional)")
     parser.add_argument("--mobilenet-checkpoint", type=Path, default=DEFAULT_MOBILENET_CHECKPOINT, help="MobileNet SSD checkpoint path")
     parser.add_argument("--yolo-checkpoint", type=Path, default=None, help="YOLO checkpoint path (ultralytics)")
-    parser.add_argument("--yolo-variant", choices=["yolo26", "yolo11n"], default="yolo26", help="Which pretrained YOLO variant to use when --model=yolo")
+    parser.add_argument("--yolo-variant", choices=["yolo26", "yolo11n"], default="yolo11n", help="Which pretrained YOLO variant to use when --model=yolo")
+    parser.add_argument("--yolo-img-size", type=int, default=416, help="Realtime YOLO inference image size; lower is faster")
+    parser.add_argument("--yolo-max-det", type=int, default=1, help="Maximum YOLO detections to keep per frame")
     parser.add_argument("--camera", type=int, default=0, help="Webcam index")
+    parser.add_argument("--camera-width", type=int, default=640, help="Webcam capture width")
+    parser.add_argument("--camera-height", type=int, default=480, help="Webcam capture height")
+    parser.add_argument(
+        "--display-scale",
+        type=float,
+        default=0.75,
+        help="Scale factor for the preview window; lower values improve UI FPS",
+    )
     parser.add_argument("--score-threshold", type=float, default=0.30, help="Objectness threshold")
     parser.add_argument("--iou-threshold", type=float, default=0.40, help="NMS IoU threshold")
     parser.add_argument(
@@ -610,6 +870,72 @@ def parse_args():
         type=int,
         default=180,
         help="How long to keep the last valid detection during brief dropouts",
+    )
+    parser.add_argument(
+        "--inference-stride",
+        type=int,
+        default=4,
+        help="Run the neural detector every N displayed frames before any active-command cooldown",
+    )
+    parser.add_argument(
+        "--detect-cooldown-ms",
+        type=int,
+        default=0,
+        help="After a valid active gesture is detected, wait this long before running neural detection again",
+    )
+    parser.add_argument(
+        "--speed-mode",
+        choices=["motion", "box"],
+        default="motion",
+        help="motion uses hand center speed; box keeps the old hand-size speed mapping",
+    )
+    parser.add_argument(
+        "--motion-low",
+        type=float,
+        default=DEFAULT_MOTION_LOW,
+        help="Normalized hand velocity that maps to the minimum active car speed",
+    )
+    parser.add_argument(
+        "--motion-high",
+        type=float,
+        default=DEFAULT_MOTION_HIGH,
+        help="Normalized hand velocity that maps to the maximum active car speed",
+    )
+    parser.add_argument(
+        "--motion-deadzone",
+        type=float,
+        default=DEFAULT_MOTION_DEADZONE,
+        help="Ignore normalized hand velocities below this value as detector jitter",
+    )
+    parser.add_argument(
+        "--motion-smoothing",
+        type=float,
+        default=DEFAULT_MOTION_SMOOTHING,
+        help="EMA factor for motion speed smoothing; larger values react faster",
+    )
+    parser.add_argument(
+        "--motion-curve",
+        type=float,
+        default=DEFAULT_MOTION_CURVE,
+        help="Motion response curve; lower values make slow movement affect speed more",
+    )
+    parser.add_argument(
+        "--command-window",
+        type=int,
+        default=3,
+        help="Number of speed samples to average before sending a car command",
+    )
+    parser.add_argument(
+        "--repeat-command-ms",
+        type=int,
+        default=120,
+        help="Repeat the last stable active command at this interval so slow inference does not pause the car",
+    )
+    parser.add_argument(
+        "--speed-change-threshold",
+        type=int,
+        default=12,
+        help="Minimum speed change required before updating a latched command speed",
     )
     parser.add_argument("--car-ip", type=str, default=DEFAULT_CAR_IP, help="Base URL of the wireless car controller")
     parser.add_argument("--mirror", action="store_true", help="Mirror the webcam preview")
@@ -638,14 +964,14 @@ def interactive_model_selection():
         elif choice == "3":
             # Prompt for YOLO variant when user picks YOLO in the UI
             print("\nChoose YOLO variant:")
-            print("1) yolo26 (default)")
-            print("2) yolo11n")
+            print("1) yolo11n (default, fastest)")
+            print("2) yolo26")
             while True:
                 v = input("Enter choice (1-2) [default: 1]: ").strip()
                 if v == "" or v == "1":
-                    return "yolo", "yolo26"
-                elif v == "2":
                     return "yolo", "yolo11n"
+                elif v == "2":
+                    return "yolo", "yolo26"
                 else:
                     print("Invalid choice. Please enter 1 or 2.")
         else:
@@ -693,7 +1019,12 @@ def main():
             ckpt = DEFAULT_YOLO11N_CHECKPOINT if args.yolo_variant == "yolo11n" else DEFAULT_YOLO26_CHECKPOINT
         if not ckpt.exists():
             raise FileNotFoundError(f"YOLO checkpoint not found: {ckpt}")
-        yolo_model, id_to_class, img_size, grid_size = load_yolo_model(ckpt, device)
+        yolo_model, id_to_class, img_size, grid_size = load_yolo_model(
+            ckpt,
+            device,
+            img_size=args.yolo_img_size,
+            max_det=args.yolo_max_det,
+        )
         yolo_model.iou_threshold = args.iou_threshold
         model_kind = "yolo"
     else:
@@ -703,17 +1034,28 @@ def main():
     last_speed = None
     last_send_time = 0.0
     last_detection = None
+    next_detection_time = 0.0
     last_valid_detection_time = 0.0
     no_hand_streak = 0
     last_gesture = "none"
     last_box_area = 0.0
     last_confidence = 0.0
     frame_index = 0
-    inference_stride = 2
+    inference_stride = max(1, args.inference_stride)
     speed_buffer: list[int] = []
     pending_command = "stop"
+    last_label = 0
+    motion_tracker = HandMotionSpeedTracker(
+        min_speed=MIN_CAR_SPEED,
+        max_speed=MAX_CAR_SPEED,
+        low_velocity=args.motion_low,
+        high_velocity=args.motion_high,
+        deadzone=args.motion_deadzone,
+        smoothing=args.motion_smoothing,
+        curve=args.motion_curve,
+    )
 
-    camera_stream = CameraStream(args.camera).start()
+    camera_stream = CameraStream(args.camera, args.camera_width, args.camera_height).start()
     sender = CommandSender(args.car_ip).start()
     last_fps_time = time.perf_counter()
     fps = 0.0
@@ -736,15 +1078,20 @@ def main():
                 if args.mirror:
                     frame = cv2.flip(frame, 1)
 
+                loop_now = time.perf_counter()
                 frame_h, frame_w = frame.shape[:2]
-                should_infer = (frame_index % inference_stride) == 0 or last_detection is None
-
                 gesture = last_gesture
                 command = COMMAND_MAP.get(gesture, "stop") if gesture != "none" else "stop"
-                speed = 0 if command == "stop" else (last_speed if last_speed is not None else 127)
+                detection_due = loop_now >= next_detection_time
+                should_infer = last_detection is None or (
+                    detection_due and (frame_index % inference_stride) == 0
+                )
+                speed = 0 if command == "stop" else (last_speed if last_speed is not None else MIN_CAR_SPEED)
                 confidence = last_confidence
                 box_area = last_box_area
+                motion_velocity = motion_tracker.peek()[1]
                 sent = sender.get_last_status()
+                predictions = last_detection
 
                 if should_infer:
                     raw_predictions = None
@@ -793,15 +1140,31 @@ def main():
                         command = COMMAND_MAP.get(gesture, "stop")
                         x1, y1, x2, y2 = box.detach().cpu().numpy().tolist()
                         box_area = max(0.0, min(1.0, max(0.0, x2 - x1) * max(0.0, y2 - y1)))
-                        speed = compute_speed_from_box_size(box)
-                        # Apply per-class size weight to compensate for
-                        # gestures that tend to appear larger.
-                        weight = CLASS_SIZE_WEIGHTS.get(gesture, 1.0)
-                        speed = int(round(speed * weight))
-                        # Clamp to requested range for active commands
-                        speed = max(127, min(255, speed))
+                        if command == "stop":
+                            speed = 0
+                            motion_tracker.reset()
+                            next_detection_time = 0.0
+                            motion_velocity = 0.0
+                        elif args.speed_mode == "motion":
+                            if has_valid:
+                                center = get_box_center(box)
+                                speed, motion_velocity = motion_tracker.update_center(center, now)
+                                cooldown_seconds = max(0.0, float(args.detect_cooldown_ms) / 1000.0)
+                                next_detection_time = now + cooldown_seconds
+                            else:
+                                speed, motion_velocity = motion_tracker.peek()
+                        else:
+                            speed = compute_speed_from_box_size(box)
+                            # Apply per-class size weight only to the legacy
+                            # box-size mode because it compensates for size bias.
+                            weight = CLASS_SIZE_WEIGHTS.get(gesture, 1.0)
+                            speed = int(round(speed * weight))
+                            speed = max(MIN_CAR_SPEED, min(MAX_CAR_SPEED, speed))
+                            cooldown_seconds = max(0.0, float(args.detect_cooldown_ms) / 1000.0)
+                            next_detection_time = now + cooldown_seconds
                         confidence = score
                         last_gesture = gesture
+                        last_label = label
                         last_box_area = box_area
                         last_confidence = confidence
                     else:
@@ -810,17 +1173,20 @@ def main():
                         speed = 0
                         confidence = 0.0
                         box_area = 0.0
+                        motion_velocity = 0.0
                         last_detection = None
                         last_gesture = gesture
                         last_box_area = box_area
                         last_confidence = confidence
-
-                    frame = draw_predictions(frame, predictions, id_to_class, frame_w, frame_h)
-                else:
-                    frame = draw_predictions(frame, last_detection, id_to_class, frame_w, frame_h)
+                        motion_tracker.reset()
+                        next_detection_time = 0.0
 
                 now = time.perf_counter()
-                if gesture == "none":
+                repeat_interval = max(0.02, float(args.repeat_command_ms) / 1000.0)
+                speed_change_threshold = max(0, int(args.speed_change_threshold))
+                command_window = max(1, int(args.command_window))
+
+                if gesture == "none" or command == "stop":
                     speed = 0
                     speed_buffer.clear()
                     if command != last_command or last_speed != 0 or (now - last_send_time) > 0.1:
@@ -829,35 +1195,55 @@ def main():
                         last_speed = 0
                         last_send_time = now
                 else:
-                    if command != pending_command and speed_buffer:
-                        averaged_speed = int(round(sum(speed_buffer) / len(speed_buffer)))
-                        sender.enqueue(pending_command, averaged_speed)
-                        last_command = pending_command
-                        last_speed = averaged_speed
-                        last_send_time = now
-                        speed_buffer.clear()
-
                     if command != pending_command:
                         pending_command = command
+                        speed_buffer.clear()
 
+                    speed = max(MIN_CAR_SPEED, int(speed))
                     speed_buffer.append(speed)
-                    if len(speed_buffer) >= 5:
-                        averaged_speed = int(round(sum(speed_buffer) / len(speed_buffer)))
+                    if len(speed_buffer) > command_window:
+                        speed_buffer.pop(0)
+
+                    averaged_speed = int(round(sum(speed_buffer) / len(speed_buffer)))
+                    has_meaningful_speed_change = (
+                        last_speed is None
+                        or abs(averaged_speed - int(last_speed)) >= speed_change_threshold
+                    )
+                    should_repeat_locked_command = (now - last_send_time) >= repeat_interval
+
+                    if command != last_command or has_meaningful_speed_change or should_repeat_locked_command:
                         sender.enqueue(command, averaged_speed)
                         last_command = command
                         last_speed = averaged_speed
                         last_send_time = now
-                        speed_buffer.clear()
 
-                frame = draw_status_panel(
-                    frame,
+                display_scale = max(0.2, min(1.0, float(args.display_scale)))
+                if display_scale < 0.999:
+                    display_frame = cv2.resize(
+                        frame,
+                        None,
+                        fx=display_scale,
+                        fy=display_scale,
+                        interpolation=cv2.INTER_AREA,
+                    )
+                else:
+                    display_frame = frame.copy()
+                display_h, display_w = display_frame.shape[:2]
+
+                display_frame = draw_predictions(display_frame, predictions, id_to_class, display_w, display_h)
+                display_frame = draw_status_panel(
+                    display_frame,
                     command,
                     gesture,
                     speed,
+                    last_command or "none",
+                    int(last_speed or 0),
                     args.car_ip,
                     sent,
                     confidence,
                     box_area,
+                    motion_velocity,
+                    args.speed_mode,
                 )
 
                 now = time.perf_counter()
@@ -873,9 +1259,9 @@ def main():
                 frame_index += 1
 
                 cv2.putText(
-                    frame,
+                    display_frame,
                     f"FPS: {fps:.1f}",
-                    (20, frame_h - 20),
+                    (20, display_h - 20),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
                     (255, 255, 0),
@@ -883,7 +1269,7 @@ def main():
                     cv2.LINE_AA,
                 )
 
-                cv2.imshow("Real-time Hand Detector", frame)
+                cv2.imshow("Real-time Hand Detector", display_frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
                     break
