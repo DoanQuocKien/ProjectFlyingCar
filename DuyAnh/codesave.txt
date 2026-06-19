@@ -1,9 +1,0 @@
-#save
-torch.save({
-    "model_state": model.state_dict(),
-    "classes": label_encoder.classes_,
-    "input_dim": X_train.shape[1]
-}, "gesture_model.pth")
-
-print("✅ Đã lưu model vào gesture_model.pth")
-print("📁 Save tại:", os.getcwd())
