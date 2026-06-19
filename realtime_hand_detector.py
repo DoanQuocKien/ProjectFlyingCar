@@ -62,21 +62,26 @@ CLASS_SIZE_WEIGHTS = {
 }
 
 
-class ResNetDetector(nn.Module):
+class ResNetLocalization(nn.Module):
     def __init__(self, num_classes: int = 5):
         super().__init__()
-        backbone = models.resnet18(weights=None)
-        self.backbone = nn.Sequential(*list(backbone.children())[:-2])
-        self.detection_head = nn.Conv2d(512, 1 + 4 + num_classes, kernel_size=1)
+        resnet = models.resnet18(weights=None)
+        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
+        self.pool = nn.AdaptiveAvgPool2d((4, 4))
+        self.head = nn.Sequential(
+            nn.Linear(512 * 16, 1024),
+            nn.ReLU(),
+            nn.Dropout(p=0.2),
+            nn.Linear(1024, 4 + num_classes)
+        )
 
     def forward(self, x: torch.Tensor):
         feat = self.backbone(x)
-        out = self.detection_head(feat)
-        out = out.permute(0, 2, 3, 1)
-        obj_logits = out[..., 0]
-        box_preds = torch.sigmoid(out[..., 1:5])
-        cls_logits = out[..., 5:]
-        return obj_logits, box_preds, cls_logits
+        feat = self.pool(feat).flatten(1)
+        out = self.head(feat)
+        box_preds = torch.sigmoid(out[:, :4])
+        cls_logits = out[:, 4:]
+        return box_preds, cls_logits
 
 
 def load_checkpoint(checkpoint_path: Path, device: torch.device):
@@ -90,7 +95,7 @@ def load_checkpoint(checkpoint_path: Path, device: torch.device):
     img_size = int(checkpoint.get("img_size", 448))
     grid_size = int(checkpoint.get("grid_size", 14))
 
-    model = ResNetDetector(num_classes=num_classes).to(device)
+    model = ResNetLocalization(num_classes=num_classes).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
@@ -98,43 +103,26 @@ def load_checkpoint(checkpoint_path: Path, device: torch.device):
 
 
 # --- MobileNet SSD transfer model (from notebook) ---
-class TransferMobileNetSSD(nn.Module):
-    """Pretrained MobileNetV3-Large backbone + SSD-style grid head."""
-    def __init__(self, num_classes: int = 5, grid_size: int = 10, freeze_backbone_until: int = 13):
+class MobileNetLocalization(nn.Module):
+    def __init__(self, num_classes=5):
         super().__init__()
-        # Use torchvision's mobilenet_v3_large features as backbone
-        mobilenet = models.mobilenet_v3_large(weights=None)
+        mobilenet = models.mobilenet_v2(weights=None)
         self.backbone = mobilenet.features
-        self.grid_size = grid_size
-        self.num_classes = num_classes
-
-        # Adapter conv: MobileNetV3-Large outputs 960 channels
-        # Use Hardswish to match MobileNetV3 internals and preserve activation statistics.
-        self.adapt_conv = nn.Sequential(
-            nn.Conv2d(960, 256, kernel_size=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.Hardswish(inplace=True)
+        self.pool = nn.AdaptiveAvgPool2d((4, 4))
+        self.head = nn.Sequential(
+            nn.Linear(1280 * 16, 1024),
+            nn.ReLU(),
+            nn.Dropout(p=0.2),
+            nn.Linear(1024, 4 + num_classes)
         )
 
-        # SSD-like detection head (keeps same channel layout expected by loss)
-        self.detection_head = nn.Sequential(
-            nn.Conv2d(256, 128, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.Hardswish(inplace=True),
-            nn.Conv2d(128, 1 + 4 + num_classes, kernel_size=1)
-        )
-
-    def forward(self, x: torch.Tensor):
+    def forward(self, x):
         feat = self.backbone(x)
-        feat = self.adapt_conv(feat)
-        feat = torch.nn.functional.adaptive_avg_pool2d(feat, output_size=(self.grid_size, self.grid_size))
-
-        out = self.detection_head(feat)
-        out = out.permute(0, 2, 3, 1)
-        obj_logits = out[..., 0]
-        box_preds = torch.sigmoid(out[..., 1:5])
-        cls_logits = out[..., 5:]
-        return obj_logits, box_preds, cls_logits
+        feat = self.pool(feat).flatten(1)
+        out = self.head(feat)
+        box_preds = torch.sigmoid(out[:, :4])
+        cls_logits = out[:, 4:]
+        return box_preds, cls_logits
 
 
 def load_mobilenet_checkpoint(checkpoint_path: Path, device: torch.device):
@@ -148,7 +136,7 @@ def load_mobilenet_checkpoint(checkpoint_path: Path, device: torch.device):
     img_size = int(checkpoint.get("img_size", 320))
     grid_size = int(checkpoint.get("grid_size", 10))
 
-    model = TransferMobileNetSSD(num_classes=num_classes, grid_size=grid_size).to(device)
+    model = MobileNetLocalization(num_classes=num_classes).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return model, id_to_class, img_size, grid_size
@@ -1098,22 +1086,41 @@ def main():
                     if model_kind == "grid":
                         assert grid_model is not None
                         input_tensor = preprocess_frame(frame, img_size, device)
-                        obj_logits, box_preds, cls_logits = grid_model(input_tensor)
-                        raw_predictions = decode_predictions(
-                            obj_logits,
-                            box_preds,
-                            cls_logits,
-                            grid_size=grid_size,
-                            score_threshold=args.score_threshold,
-                            iou_threshold=args.iou_threshold,
-                            detection_mode=args.detection_mode,
-                            max_det=args.max_det,
-                        )[0]
+                        box_preds, cls_logits = grid_model(input_tensor)
+                        probs = torch.softmax(cls_logits, dim=-1)
+                        scores, labels = torch.max(probs, dim=1)
+                        x_c, y_c, w, h = box_preds.unbind(1)
+                        pred_boxes_xyxy = torch.stack([x_c - w/2, y_c - h/2, x_c + w/2, y_c + h/2], dim=1).clamp(0, 1)
+                        raw_predictions = {
+                            "boxes": pred_boxes_xyxy,
+                            "scores": scores,
+                            "labels": labels
+                        }
                     else:
-                        # YOLO pipeline returns normalized boxes directly
                         assert yolo_model is not None
-                        raw_predictions = yolo_model.predict_frame(frame, score_threshold=args.score_threshold)
+                        raw_predictions = yolo_model.predict_frame(frame, score_threshold=0.5)
 
+                    # Enforce single highest confidence prediction >= 0.5
+                    if raw_predictions is not None and len(raw_predictions["boxes"]) > 0:
+                        boxes = raw_predictions["boxes"]
+                        scores = raw_predictions["scores"]
+                        labels = raw_predictions["labels"]
+                        
+                        keep_mask = scores >= 0.5
+                        if not keep_mask.any():
+                            raw_predictions = None
+                        else:
+                            boxes = boxes[keep_mask]
+                            scores = scores[keep_mask]
+                            labels = labels[keep_mask]
+                            
+                            best_idx = torch.argmax(scores)
+                            raw_predictions = {
+                                "boxes": boxes[best_idx].unsqueeze(0),
+                                "scores": scores[best_idx].unsqueeze(0),
+                                "labels": labels[best_idx].unsqueeze(0)
+                            }
+                    
                     now = time.perf_counter()
                     hold_seconds = max(0.0, float(args.hold_last_detection_ms) / 1000.0)
                     has_valid = raw_predictions is not None and len(raw_predictions["boxes"]) > 0
@@ -1139,7 +1146,11 @@ def main():
                         gesture = id_to_class.get(label, str(label))
                         command = COMMAND_MAP.get(gesture, "stop")
                         x1, y1, x2, y2 = box.detach().cpu().numpy().tolist()
-                        box_area = max(0.0, min(1.0, max(0.0, x2 - x1) * max(0.0, y2 - y1)))
+                        box_w = max(0.0, x2 - x1)
+                        box_h = max(0.0, y2 - y1)
+                        # Print the exact mathematical output format required by the problem statement
+                        print(f"y_i = ({score:.3f}, [{x1:.3f}, {y1:.3f}, {box_w:.3f}, {box_h:.3f}], {label + 1})  # {gesture}")
+                        box_area = max(0.0, min(1.0, box_w * box_h))
                         if command == "stop":
                             speed = 0
                             motion_tracker.reset()
